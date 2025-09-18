@@ -1,11 +1,364 @@
 ---
-import Welcome from '../components/Welcome.astro';
 import Layout from '../layouts/Layout.astro';
-
-// Welcome to Astro! Wondering what to do next? Check out the Astro documentation at https://docs.astro.build
-// Don't want to use any of this? Delete everything in this file, the `assets`, `components`, and `layouts` directories, and start fresh.
 ---
 
 <Layout>
-	<Welcome />
+  <div class="container">
+    <header class="appbar">
+      <div class="appbar-inner">
+        <div class="brand">
+          <div class="brand-badge">✦</div>
+          <div class="brand-title">Ocean Notes</div>
+          <span class="badge" id="note-count">0</span>
+        </div>
+        <div class="appbar-actions">
+          <button class="icon-btn primary" id="new-note-btn" title="New note">
+            <span>New</span>
+          </button>
+          <button class="icon-btn" id="delete-note-btn" title="Delete note">
+            <span>Delete</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="shell">
+        <!-- Sidebar -->
+        <aside class="card sidebar" id="sidebar">
+          <div class="search">
+            <input id="search" class="input" placeholder="Search notes..." />
+            <button class="icon-btn" id="clear-search" title="Clear search">Clear</button>
+          </div>
+          <div class="search" style="padding-top: 0; border-top: 0;">
+            <select id="sort" class="input" style="grid-column: 1 / -1;">
+              <option value="updated_desc">Sort by: Recently updated</option>
+              <option value="updated_asc">Sort by: Oldest updated</option>
+              <option value="title_asc">Sort by: Title A → Z</option>
+              <option value="title_desc">Sort by: Title Z → A</option>
+            </select>
+          </div>
+          <div class="notes-list" id="notes-list" role="listbox" aria-label="Notes list"></div>
+        </aside>
+
+        <!-- Editor -->
+        <section class="card editor" id="editor">
+          <div class="toolbar">
+            <input id="title" class="title-input" placeholder="Note title..." />
+            <div class="segment" role="tablist" aria-label="View mode">
+              <button id="mode-edit" class="active" role="tab" aria-selected="true">Edit</button>
+              <button id="mode-view" role="tab" aria-selected="false">View</button>
+            </div>
+          </div>
+          <div class="content-wrap" id="content-wrap">
+            <textarea id="content" class="textarea" placeholder="Write your note here..."></textarea>
+            <article id="viewer" class="viewer" style="display: none;"></article>
+          </div>
+          <div class="footerbar">
+            <div>
+              <span id="status">Ready</span>
+            </div>
+            <div>
+              <small id="meta">No note selected</small>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="card empty" id="empty" style="display:none;">
+        <div>
+          <div style="font-size: 32px; margin-bottom: 8px;">📝</div>
+          <div style="font-weight: 600; text-align: center; margin-bottom: 8px;">No notes yet</div>
+          <div style="text-align: center; color: var(--muted);">Create your first note to get started.</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    // PUBLIC_INTERFACE
+    function markdownToHtml(md) {
+      /** Convert a minimal subset of markdown to HTML for viewer mode. */
+      if (!md) return '';
+      // escape HTML
+      const escape = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      // headings
+      let html = md.split('\\n').map(line => {
+        if (/^#\\s+/.test(line)) return '<h1>' + escape(line.replace(/^#\\s+/,'')).trim() + '</h1>';
+        if (/^##\\s+/.test(line)) return '<h2>' + escape(line.replace(/^##\\s+/,'')).trim() + '</h2>';
+        if (/^###\\s+/.test(line)) return '<h3>' + escape(line.replace(/^###\\s+/,'')).trim() + '</h3>';
+        return '<p>' + escape(line) + '</p>';
+      }).join('\\n');
+
+      // bold and italic
+      html = html
+        .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+        .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>');
+      return html;
+    }
+
+    // Placeholder API client with localStorage fallback
+    const API = (() => {
+      const STORAGE_KEY = 'ocean-notes-v1';
+      const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+      // PUBLIC_INTERFACE
+      async function listNotes() {
+        /** List notes from storage. */
+        await delay(60);
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return [];
+        try { return JSON.parse(raw); } catch { return []; }
+      }
+
+      // PUBLIC_INTERFACE
+      async function saveNotes(notes) {
+        /** Persist notes to storage. */
+        await delay(60);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
+        return true;
+      }
+
+      return { listNotes, saveNotes };
+    })();
+
+    // Notes state management
+    const state = {
+      notes: [],
+      selectedId: null,
+      mode: 'edit', // or 'view'
+      search: '',
+      sort: 'updated_desc',
+      debouncers: new Map(),
+    };
+
+    function uid() {
+      return Math.random().toString(36).slice(2, 10);
+    }
+
+    function debounce(key, fn, wait=300) {
+      const existing = state.debouncers.get(key);
+      if (existing) clearTimeout(existing);
+      const t = setTimeout(fn, wait);
+      state.debouncers.set(key, t);
+    }
+
+    function formatDate(ts) {
+      const d = new Date(ts);
+      return d.toLocaleString();
+    }
+
+    function setStatus(msg) {
+      const el = document.getElementById('status');
+      if (el) el.textContent = msg;
+    }
+
+    function setMeta(msg) {
+      const el = document.getElementById('meta');
+      if (el) el.textContent = msg;
+    }
+
+    function currentNote() {
+      return state.notes.find(n => n.id === state.selectedId) || null;
+    }
+
+    function filteredSortedNotes() {
+      const q = state.search.trim().toLowerCase();
+      let arr = state.notes.filter(n =>
+        n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q)
+      );
+      switch (state.sort) {
+        case 'updated_asc':
+          arr.sort((a, b) => a.updatedAt - b.updatedAt); break;
+        case 'title_asc':
+          arr.sort((a, b) => a.title.localeCompare(b.title)); break;
+        case 'title_desc':
+          arr.sort((a, b) => b.title.localeCompare(a.title)); break;
+        case 'updated_desc':
+        default:
+          arr.sort((a, b) => b.updatedAt - a.updatedAt); break;
+      }
+      return arr;
+    }
+
+    function renderList() {
+      const list = document.getElementById('notes-list');
+      const count = document.getElementById('note-count');
+      const arr = filteredSortedNotes();
+      if (count) count.textContent = arr.length.toString();
+
+      list.innerHTML = '';
+      arr.forEach(n => {
+        const item = document.createElement('div');
+        item.className = 'note-item' + (n.id === state.selectedId ? ' active' : '');
+        item.setAttribute('role', 'option');
+        item.setAttribute('aria-selected', n.id === state.selectedId ? 'true' : 'false');
+
+        const left = document.createElement('div');
+        const ttl = document.createElement('div');
+        ttl.className = 'note-title';
+        ttl.textContent = n.title || 'Untitled';
+        const meta = document.createElement('div');
+        meta.className = 'note-meta';
+        meta.textContent = 'Updated ' + formatDate(n.updatedAt);
+        left.appendChild(ttl);
+        left.appendChild(meta);
+
+        const right = document.createElement('div');
+        right.className = 'note-meta';
+        right.textContent = (n.content || '').slice(0, 24);
+
+        item.appendChild(left);
+        item.appendChild(right);
+
+        item.addEventListener('click', () => {
+          state.selectedId = n.id;
+          renderAll();
+        });
+
+        list.appendChild(item);
+      });
+
+      document.getElementById('empty').style.display = arr.length ? 'none' : 'grid';
+    }
+
+    function renderEditor() {
+      const note = currentNote();
+      const title = document.getElementById('title');
+      const content = document.getElementById('content');
+      const viewer = document.getElementById('viewer');
+      const modeEdit = document.getElementById('mode-edit');
+      const modeView = document.getElementById('mode-view');
+
+      modeEdit.classList.toggle('active', state.mode === 'edit');
+      modeView.classList.toggle('active', state.mode === 'view');
+
+      if (!note) {
+        title.value = '';
+        content.value = '';
+        viewer.innerHTML = '';
+        setMeta('No note selected');
+        setStatus('Ready');
+        return;
+      }
+
+      title.value = note.title;
+      content.value = note.content;
+
+      if (state.mode === 'edit') {
+        content.style.display = '';
+        viewer.style.display = 'none';
+      } else {
+        content.style.display = 'none';
+        viewer.style.display = '';
+        viewer.innerHTML = markdownToHtml(note.content);
+      }
+
+      setMeta('Created ' + formatDate(note.createdAt) + ' • Updated ' + formatDate(note.updatedAt));
+    }
+
+    async function persist() {
+      await API.saveNotes(state.notes);
+    }
+
+    async function init() {
+      setStatus('Loading…');
+      state.notes = await API.listNotes();
+
+      // initialize default selected note
+      if (state.notes.length) {
+        state.selectedId = state.notes[0].id;
+      }
+
+      hookEvents();
+      renderAll();
+      setStatus('Ready');
+    }
+
+    function renderAll() {
+      renderList();
+      renderEditor();
+    }
+
+    function hookEvents() {
+      document.getElementById('new-note-btn').addEventListener('click', () => {
+        const now = Date.now();
+        const n = { id: uid(), title: 'Untitled', content: '', createdAt: now, updatedAt: now };
+        state.notes.unshift(n);
+        state.selectedId = n.id;
+        persist();
+        renderAll();
+        setStatus('New note created');
+      });
+
+      document.getElementById('delete-note-btn').addEventListener('click', () => {
+        const note = currentNote();
+        if (!note) return;
+        const idx = state.notes.findIndex(n => n.id === note.id);
+        if (idx >= 0) {
+          state.notes.splice(idx, 1);
+          state.selectedId = state.notes[0]?.id || null;
+          persist();
+          renderAll();
+          setStatus('Note deleted');
+        }
+      });
+
+      document.getElementById('title').addEventListener('input', (e) => {
+        const note = currentNote();
+        if (!note) return;
+        note.title = e.target.value;
+        note.updatedAt = Date.now();
+        debounce('save-title', () => { persist(); renderList(); setStatus('Saved'); }, 400);
+      });
+
+      document.getElementById('content').addEventListener('input', (e) => {
+        const note = currentNote();
+        if (!note) return;
+        note.content = e.target.value;
+        note.updatedAt = Date.now();
+        debounce('save-content', () => {
+          persist();
+          if (state.mode === 'view') {
+            renderEditor();
+          } else {
+            renderList();
+          }
+          setStatus('Saved');
+        }, 400);
+      });
+
+      document.getElementById('mode-edit').addEventListener('click', () => {
+        state.mode = 'edit';
+        renderEditor();
+      });
+      document.getElementById('mode-view').addEventListener('click', () => {
+        state.mode = 'view';
+        renderEditor();
+      });
+
+      document.getElementById('search').addEventListener('input', (e) => {
+        state.search = e.target.value;
+        renderList();
+      });
+      document.getElementById('clear-search').addEventListener('click', () => {
+        const s = document.getElementById('search');
+        s.value = '';
+        state.search = '';
+        renderList();
+      });
+
+      document.getElementById('sort').addEventListener('change', (e) => {
+        state.sort = e.target.value;
+        renderList();
+      });
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  </script>
 </Layout>
